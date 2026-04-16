@@ -16,10 +16,93 @@
 #include <android/log.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
 #define TAG "VulkanShim"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+/* ------------------------------------------------------------------ */
+/* State                                                               */
+/* ------------------------------------------------------------------ */
+static void  *g_sys_vulkan   = NULL;  /* handle to system libvulkan.so */
+static char   g_lib_dir[512];         /* our lib directory             */
+static char   g_turnip_path[512];     /* full path to Turnip ICD       */
+static void *g_turnip = NULL;
+
+// Log file code
+static FILE *g_logfile = NULL;
+
+static void init_logfile(void) {
+    if (g_logfile) return;
+    
+    /* Extract package name from our lib path */
+    char *pkg_start = strstr(g_lib_dir, "/data/app/");
+    if (!pkg_start) return;
+    
+    char *after_hash = strchr(pkg_start + 10, '/');
+    if (!after_hash) return;
+    after_hash++;
+    
+    char *dash = strstr(after_hash, "-");
+    if (!dash) return;
+    
+    char pkg[256] = {0};
+    strncpy(pkg, after_hash, dash - after_hash);
+    
+    /* Build path: /sdcard/Android/data/<pkg>/files/vulkan_shim.log */
+    char path[512];
+    snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files", pkg);
+    mkdir(path, 0755);  /* ensure it exists */
+    
+    strncat(path, "/vulkan_shim.log", sizeof(path) - strlen(path) - 1);
+    
+    g_logfile = fopen(path, "a");
+    if (g_logfile) {
+        setvbuf(g_logfile, NULL, _IOLBF, 0);  /* line-buffered for safety */
+        time_t now = time(NULL);
+        fprintf(g_logfile, "\n=== shim started at %s", ctime(&now));
+    }
+}
+
+static void log_to_file(const char *level, const char *fmt, va_list args) {
+    if (!g_logfile) init_logfile();
+    if (!g_logfile) return;
+    
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    
+    fprintf(g_logfile, "%02d:%02d:%02d.%03ld [%s] ",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000,
+            level);
+    vfprintf(g_logfile, fmt, args);
+    fputc('\n', g_logfile);
+}
+
+static void shim_logi(const char *fmt, ...) {
+    va_list args, args2;
+    va_start(args, fmt);
+    va_copy(args2, args);
+    __android_log_vprint(ANDROID_LOG_INFO, TAG, fmt, args);
+    log_to_file("I", fmt, args2);
+    va_end(args);
+    va_end(args2);
+}
+
+static void shim_loge(const char *fmt, ...) {
+    va_list args, args2;
+    va_start(args, fmt);
+    va_copy(args2, args);
+    __android_log_vprint(ANDROID_LOG_ERROR, TAG, fmt, args);
+    log_to_file("E", fmt, args2);
+    va_end(args);
+    va_end(args2);
+}
+
+#define LOGI(...) shim_logi(__VA_ARGS__)
+#define LOGE(...) shim_loge(__VA_ARGS__)
 
 typedef void (*PFN_vkVoidFunction)(void);
 typedef void*    VkInstance;
@@ -99,14 +182,6 @@ static void hooked_CmdCopyImageToBuffer2(
     if (g_real_copy_itb2)
         g_real_copy_itb2(cmdBuf, pInfo);
 }
-
-/* ------------------------------------------------------------------ */
-/* State                                                               */
-/* ------------------------------------------------------------------ */
-static void  *g_sys_vulkan   = NULL;  /* handle to system libvulkan.so */
-static char   g_lib_dir[512];         /* our lib directory             */
-static char   g_turnip_path[512];     /* full path to Turnip ICD       */
-static void *g_turnip = NULL;
 
 /* The real android_load_sphal_library so we can call it for non-Vulkan */
 static void *(*g_real_sphal_load)(const char *name, int flags) = NULL;
@@ -514,22 +589,27 @@ int get_adreno_model(char *value) {
     /* Android 12+ standardized property */
     if (__system_property_get("ro.soc.model", value) > 0) {
         /* SM8750 = Snapdragon 8 Elite (Adreno 830) */
-        if (strstr(value, "SM8750")) return 830;
-        if (strstr(value, "SM8650")) return 750;
-        if (strstr(value, "SM8550")) return 740;
+		/* Elite-class / A8xx GPUs */
+        if (strstr(value, "SM8850")) return 840;  /* 8 Elite Gen 5 / Elite 2 */
+        if (strstr(value, "SM8845")) return 830;  /* 8 Gen 5 (flagship variant) */
+        if (strstr(value, "SM8750")) return 830;  /* 8 Elite Gen 4 */
+		
         /* extend as needed */
 		if (value[0] != 0) return 0;		// If we got a value just return the string
     }
 
     /* Fallback: some OEMs use this instead */
     if (__system_property_get("ro.hardware.chipname", value) > 0) {
-        if (strstr(value, "sm8750")) return 830;
+		if (strstr(value, "sm8850") || strstr(value, "SM8850")) return 840;
+        if (strstr(value, "sm8750") || strstr(value, "SM8750")) return 830;
+		
 		if (value[0] != 0) return 0;		// If we got a value just return the string
     }
 
     /* Another fallback */
     if (__system_property_get("ro.board.platform", value) > 0) {
-        if (strcmp(value, "sun") == 0) return 830;  /* SM8750 codename */
+		if (strcmp(value, "pineapple") == 0) return 830;  /* SM8750 */
+        if (strcmp(value, "sun") == 0)       return 840;  /* SM8850 (rumoured) */
     }
 
     return 0;
@@ -562,7 +642,6 @@ static void shim_init(void) {
 	
     char value[PROP_VALUE_MAX] = {0};
 	int adreno_model = get_adreno_model(value);
-	LOGI("VulkanShim: adreno_model = %d (%s)\n", adreno_model, value);
 		
 	//setup_turnip_env(1, 1, 1);
 	// No TU_DEBUG flags needed — readback barrier hook ensures UBWC
@@ -583,11 +662,28 @@ static void shim_init(void) {
     if (!slash) return;
     *(slash + 1) = '\0';
     LOGI("VulkanShim: lib dir = %s", g_lib_dir);
-
-	if (strcmp(value, "SM8250") == 0 || strcasecmp(value, "kona") == 0)
-		snprintf(g_turnip_path, sizeof(g_turnip_path), "%slibvulkan_freedreno_T19.so", g_lib_dir);		// For SD865 - Use T19. Change Hardware mode to Disable Readbacks if crashing.
-	else
-		snprintf(g_turnip_path, sizeof(g_turnip_path), "%slibvulkan_freedreno_T26.so", g_lib_dir);		// Use Mr Purple T26 for everything else
+	LOGI("VulkanShim: adreno_model = %d (%s)\n", adreno_model, value);
+	
+	// Check for override
+	const char *override_path = "/data/local/tmp/libvulkan_freedreno.so";
+	if (access(override_path, F_OK) == 0) {
+		strcpy(g_turnip_path, override_path);
+		LOGI("VulkanShim: Using Override");
+	}
+	else {
+		if (strcmp(value, "SM8250") == 0 || strcasecmp(value, "kona") == 0) {
+			snprintf(g_turnip_path, sizeof(g_turnip_path), "%slibvulkan_freedreno_v24.1.0_R18.a6xx-Patched.so", g_lib_dir);		// For SD865 - Use a patched Turnip. Change Hardware mode to Disable Readbacks if crashing.
+			LOGI("VulkanShim: Using Kona specific driver");
+		} else {
+			if (adreno_model != 0) {
+				snprintf(g_turnip_path, sizeof(g_turnip_path), "%slibvulkan_freedreno_Gen8_v28.so", g_lib_dir);		// Use this for Adreno 8
+				LOGI("VulkanShim: Using Snapdragon ELITE driver");
+			} else {
+				snprintf(g_turnip_path, sizeof(g_turnip_path), "%slibvulkan_freedreno_v26.2.0_R1.so", g_lib_dir);		// Use this for Adreno 7
+				LOGI("VulkanShim: Using *everything else* driver");
+			}
+		}
+	}
 			 
     LOGI("VulkanShim: Turnip path = %s", g_turnip_path);
 
