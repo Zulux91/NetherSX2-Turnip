@@ -203,6 +203,28 @@ VkResult hooked_EnumeratePhysicalDevices(VkInstance inst, uint32_t *pCount, void
 static void *(*g_real_sphal_load)(const char *name, int flags) = NULL;
 
 /* ------------------------------------------------------------------ */
+/* Page-size helpers — agnostic to 4K / 16K / 64K kernels            */
+/* ------------------------------------------------------------------ */
+
+static uintptr_t get_page_size(void) {
+    static uintptr_t s_page_size = 0;
+    if (!s_page_size) {
+        long r = sysconf(_SC_PAGESIZE);
+        s_page_size = (r > 0) ? (uintptr_t)r : 4096u;
+    }
+    return s_page_size;
+}
+
+/* Round addr DOWN to the page boundary that contains it */
+#define PAGE_FLOOR(addr) \
+    ((uintptr_t)(addr) & ~(get_page_size() - 1u))
+
+/* Round addr+len UP to the next page boundary (i.e. end of last touched page) */
+#define PAGE_CEIL(addr, len) \
+    (((uintptr_t)(addr) + (uintptr_t)(len) + get_page_size() - 1u) \
+     & ~(get_page_size() - 1u))
+
+/* ------------------------------------------------------------------ */
 /* GOT patching helpers                                                */
 /* ------------------------------------------------------------------ */
 
@@ -287,8 +309,8 @@ static int patch_got(uintptr_t base, const char *symbol_name, void *new_fn) {
                  symbol_name, got_entry, *got_entry);
 
             /* Make page writable */
-            uintptr_t page     = (uintptr_t)got_entry & ~(uintptr_t)(4095);
-            uintptr_t page_end = ((uintptr_t)got_entry + sizeof(uintptr_t) + 4095) & ~(uintptr_t)(4095);
+            uintptr_t page     = PAGE_FLOOR(got_entry);
+            uintptr_t page_end = PAGE_CEIL(got_entry, sizeof(uintptr_t));
             if (mprotect((void *)page, page_end - page,
                          PROT_READ | PROT_WRITE) != 0) {
                 LOGE("VulkanShim: mprotect failed");
@@ -366,8 +388,8 @@ static int patch_got_with_real(uintptr_t base, const char *symbol_name, void *ne
                 uintptr_t *got = (uintptr_t *)(load_bias + (table)[i].r_offset); \
                 LOGI("VulkanShim: found %s at %p (val=0x%lx)",             \
                      symbol_name, got, *got);                               \
-                uintptr_t pg  = (uintptr_t)got & ~(uintptr_t)4095;         \
-                uintptr_t end = ((uintptr_t)got + 8 + 4095) & ~(uintptr_t)4095; \
+                uintptr_t pg  = PAGE_FLOOR(got);                          \
+                uintptr_t end = PAGE_CEIL(got, sizeof(uintptr_t));         \
                 mprotect((void*)pg, end-pg, PROT_READ|PROT_WRITE);         \
                 *got = (uintptr_t)new_fn;                                   \
                 mprotect((void*)pg, end-pg, PROT_READ|PROT_EXEC);          \
