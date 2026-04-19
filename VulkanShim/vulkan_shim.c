@@ -609,6 +609,7 @@ int get_adreno_model(char *value) {
         if (strstr(value, "SM8850")) return 840;  /* 8 Elite Gen 5 / Elite 2 */
         if (strstr(value, "SM8845")) return 830;  /* 8 Gen 5 (flagship variant) */
         if (strstr(value, "SM8750")) return 830;  /* 8 Elite Gen 4 */
+        if (strstr(value, "CQ8725")) return 830;  /* Dragonwing Q8 (Odin 3) - Adreno 830, same GPU as 8 Elite */
 		if (strstr(value, "SM8735")) return 825;  /* 8s Gen 4 */
 		
         /* extend as needed */
